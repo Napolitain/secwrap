@@ -8,9 +8,9 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
-    in
-    {
-      packages.${system}.default = pkgs.stdenv.mkDerivation {
+      inherit (pkgs) lib;
+
+      secwrapPackage = pkgs.stdenv.mkDerivation {
         pname = "secwrap";
         version = "0.1.0";
         src = ./.;
@@ -49,9 +49,81 @@
         meta = {
           description = "Small seccomp command wrapper";
           homepage = "https://github.com/Napolitain/secwrap";
-          license = pkgs.lib.licenses.mit;
+          license = lib.licenses.mit;
           mainProgram = "secwrap";
-          platforms = pkgs.lib.platforms.linux;
+          platforms = lib.platforms.linux;
+        };
+      };
+
+      makeSecwrapWrappers =
+        {
+          name ? "secwrap-wrappers",
+          secwrap ? secwrapPackage,
+          tools,
+        }:
+        pkgs.runCommand name { } (
+          ''
+            mkdir -p "$out/bin"
+          ''
+          + lib.concatMapStringsSep "\n" (
+            tool:
+            let
+              outputName = tool.outputName or tool.name;
+              argv0 = tool.argv0 or tool.name;
+              extraArgs = tool.extraSecwrapArgs or [ ];
+              apparmorPrefix =
+                if tool ? apparmorProfile then
+                  "${pkgs.apparmor-bin-utils}/bin/aa-exec -p ${lib.escapeShellArg tool.apparmorProfile} -- "
+                else
+                  "";
+              secwrapArgs =
+                [
+                  "--profile"
+                  tool.profile
+                ]
+                ++ extraArgs
+                ++ [
+                  "--target"
+                  tool.target
+                  "--argv0"
+                  argv0
+                  "--"
+                ];
+            in
+            ''
+              cat > "$out/bin/${outputName}" <<'EOF'
+              #!${pkgs.runtimeShell}
+              exec ${apparmorPrefix}${secwrap}/bin/secwrap ${lib.escapeShellArgs secwrapArgs} "$@"
+              EOF
+              chmod +x "$out/bin/${outputName}"
+            ''
+          ) tools
+        );
+    in
+    {
+      lib.${system} = {
+        inherit makeSecwrapWrappers;
+      };
+
+      packages.${system} = {
+        default = secwrapPackage;
+
+        example-wrappers = makeSecwrapWrappers {
+          name = "secwrap-example-wrappers";
+          tools = [
+            {
+              name = "broken-ls";
+              profile = "broken-ls";
+              target = "${pkgs.coreutils-full}/bin/ls";
+              argv0 = "ls";
+            }
+            {
+              name = "protected-ls";
+              profile = "local-cli";
+              target = "${pkgs.coreutils-full}/bin/ls";
+              argv0 = "ls";
+            }
+          ];
         };
       };
 

@@ -22,6 +22,7 @@ const Profile = enum {
     fn parse(value: []const u8) ?Profile {
         if (std.mem.eql(u8, value, "local-cli")) return .local_cli;
         if (std.mem.eql(u8, value, "monitor")) return .monitor;
+        if (std.mem.eql(u8, value, "broken-ls")) return .strict_test;
         if (std.mem.eql(u8, value, "strict-test")) return .strict_test;
         return null;
     }
@@ -32,6 +33,8 @@ const Options = struct {
     deny_inet: bool = false,
     deny_netlink: bool = false,
     syscall_rules: std.StringArrayHashMapUnmanaged(bool) = .{},
+    target_path: ?[]const u8 = null,
+    argv0: ?[]const u8 = null,
     command_index: usize = 0,
 
     fn addDeny(self: *Options, allocator: std.mem.Allocator, name: []const u8) !void {
@@ -46,9 +49,12 @@ const Options = struct {
 fn usage() void {
     std.debug.print(
         \\Usage: secwrap [OPTIONS] -- <command> [args...]
+        \\       secwrap [OPTIONS] --target <absolute-path> [--argv0 <name>] -- [args...]
         \\
         \\Options:
-        \\  --profile <name>          local-cli, monitor, or strict-test
+        \\  --profile <name>          local-cli, monitor, broken-ls, or strict-test
+        \\  --target <path>           execute an absolute target path without PATH lookup
+        \\  --argv0 <name>            set argv[0] when using --target
         \\  --deny-inet              deny IPv4 and IPv6 socket creation
         \\  --allow-netlink          allow AF_NETLINK socket creation
         \\  --deny-syscall <name>    deny a syscall by name
@@ -122,6 +128,16 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingProfile;
             options.profile = Profile.parse(args[i]) orelse return error.UnknownProfile;
+        } else if (std.mem.eql(u8, arg, "--target")) {
+            i += 1;
+            if (i >= args.len) return error.MissingTarget;
+            if (!std.fs.path.isAbsolute(args[i])) return error.InvalidTarget;
+            options.target_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--argv0")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgv0;
+            if (args[i].len == 0) return error.InvalidArgv0;
+            options.argv0 = args[i];
         } else if (std.mem.eql(u8, arg, "--deny-inet")) {
             try deferred_overrides.append("--deny-inet");
         } else if (std.mem.eql(u8, arg, "--allow-netlink")) {
@@ -154,7 +170,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Options {
         }
     }
 
-    if (options.command_index == 0 or options.command_index >= args.len) return error.MissingCommand;
+    if (options.command_index == 0) return error.MissingCommand;
+    if (options.target_path == null and options.argv0 != null) return error.Argv0RequiresTarget;
+    if (options.target_path == null and options.command_index >= args.len) return error.MissingCommand;
     return options;
 }
 
@@ -242,6 +260,23 @@ fn execCommand(allocator: std.mem.Allocator, command: []const []const u8) !noret
     std.process.exit(127);
 }
 
+fn execTarget(allocator: std.mem.Allocator, target_path: []const u8, argv0: ?[]const u8, args: []const []const u8) !noreturn {
+    const target_z = try allocator.dupeZ(u8, target_path);
+    const arg0 = argv0 orelse std.fs.path.basename(target_path);
+
+    var argv = try allocator.alloc(?[*:0]const u8, args.len + 2);
+    argv[0] = try allocator.dupeZ(u8, arg0);
+    for (args, 0..) |arg, idx| {
+        argv[idx + 1] = try allocator.dupeZ(u8, arg);
+    }
+    argv[args.len + 1] = null;
+
+    _ = c.execv(target_z, @ptrCast(argv.ptr));
+    const errno = std.posix.errno(-1);
+    std.debug.print("exec failed for '{s}': {s}\n", .{ target_path, @tagName(errno) });
+    std.process.exit(127);
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
 
@@ -273,7 +308,11 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(126);
     };
 
-    try execCommand(allocator, args[options.command_index..]);
+    if (options.target_path) |target_path| {
+        try execTarget(allocator, target_path, options.argv0, args[options.command_index..]);
+    } else {
+        try execCommand(allocator, args[options.command_index..]);
+    }
 }
 
 test "local-cli profile denies inet and netlink" {
@@ -304,4 +343,40 @@ test "explicit syscall allow removes profile deny" {
     const args = [_][]const u8{ "secwrap", "--profile", "local-cli", "--allow-syscall", "ptrace", "--", "true" };
     const options = try parseArgs(arena.allocator(), &args);
     try std.testing.expectEqual(false, options.syscall_rules.get("ptrace").?);
+}
+
+test "target mode accepts absolute target and forwarded args" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const args = [_][]const u8{ "secwrap", "--profile", "local-cli", "--target", "/run/current-system/sw/bin/ls", "--argv0", "ls", "--", "-la" };
+    const options = try parseArgs(arena.allocator(), &args);
+    try std.testing.expectEqualStrings("/run/current-system/sw/bin/ls", options.target_path.?);
+    try std.testing.expectEqualStrings("ls", options.argv0.?);
+    try std.testing.expectEqual(@as(usize, 8), options.command_index);
+}
+
+test "target mode rejects relative target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const args = [_][]const u8{ "secwrap", "--target", "ls", "--" };
+    try std.testing.expectError(error.InvalidTarget, parseArgs(arena.allocator(), &args));
+}
+
+test "target mode permits no forwarded args after separator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const args = [_][]const u8{ "secwrap", "--target", "/bin/true", "--" };
+    const options = try parseArgs(arena.allocator(), &args);
+    try std.testing.expectEqual(@as(usize, 4), options.command_index);
+}
+
+test "argv0 requires target mode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const args = [_][]const u8{ "secwrap", "--argv0", "name", "--", "true" };
+    try std.testing.expectError(error.Argv0RequiresTarget, parseArgs(arena.allocator(), &args));
 }
