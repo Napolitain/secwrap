@@ -6,133 +6,161 @@
   outputs =
     { nixpkgs, ... }:
     let
-      system = "x86_64-linux";
-      pkgs = import nixpkgs { inherit system; };
-      inherit (pkgs) lib;
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
 
-      secwrapPackage = pkgs.stdenv.mkDerivation {
-        pname = "secwrap";
-        version = "0.1.0";
-        src = ./.;
+      forAllSystems = nixpkgs.lib.genAttrs systems;
 
-        nativeBuildInputs = [
-          pkgs.pkg-config
-          pkgs.zig
-        ];
+      mkOutputs =
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          inherit (pkgs) lib;
 
-        buildInputs = [
-          pkgs.libseccomp
-        ];
+          secwrapPackage = pkgs.stdenv.mkDerivation {
+            pname = "secwrap";
+            version = "0.1.0";
+            src = ./.;
 
-        dontConfigure = true;
+            nativeBuildInputs = [
+              pkgs.pkg-config
+              pkgs.zig
+            ];
 
-        buildPhase = ''
-          runHook preBuild
-          export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
-          zig build -Doptimize=ReleaseSafe --prefix "$out"
-          runHook postBuild
-        '';
+            buildInputs = [
+              pkgs.libseccomp
+            ];
 
-        installPhase = ''
-          runHook preInstall
-          runHook postInstall
-        '';
+            dontConfigure = true;
 
-        doCheck = true;
-        checkPhase = ''
-          runHook preCheck
-          export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
-          zig build test
-          runHook postCheck
-        '';
+            buildPhase = ''
+              runHook preBuild
+              export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
+              zig build -Doptimize=ReleaseSafe --prefix "$out"
+              runHook postBuild
+            '';
 
-        meta = {
-          description = "Small seccomp command wrapper";
-          homepage = "https://github.com/Napolitain/secwrap";
-          license = lib.licenses.mit;
-          mainProgram = "secwrap";
-          platforms = lib.platforms.linux;
-        };
-      };
+            installPhase = ''
+              runHook preInstall
+              runHook postInstall
+            '';
 
-      makeSecwrapWrappers =
+            doCheck = true;
+            checkPhase = ''
+              runHook preCheck
+              export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
+              zig build test
+              runHook postCheck
+            '';
+
+            meta = {
+              description = "Small seccomp command wrapper";
+              homepage = "https://github.com/Napolitain/secwrap";
+              license = lib.licenses.mit;
+              mainProgram = "secwrap";
+              platforms = lib.platforms.linux;
+            };
+          };
+
+          makeSecwrapWrappers =
+            {
+              name ? "secwrap-wrappers",
+              secwrap ? secwrapPackage,
+              tools,
+            }:
+            pkgs.runCommand name { } (
+              ''
+                mkdir -p "$out/bin"
+              ''
+              + lib.concatMapStringsSep "\n" (
+                tool:
+                let
+                  outputName = tool.outputName or tool.name;
+                  argv0 = tool.argv0 or tool.name;
+                  extraArgs = tool.extraSecwrapArgs or [ ];
+                  apparmorPrefix =
+                    if tool ? apparmorProfile then
+                      "${pkgs.apparmor-bin-utils}/bin/aa-exec -p ${lib.escapeShellArg tool.apparmorProfile} -- "
+                    else
+                      "";
+                  secwrapArgs =
+                    [
+                      "--profile"
+                      tool.profile
+                    ]
+                    ++ extraArgs
+                    ++ [
+                      "--target"
+                      tool.target
+                      "--argv0"
+                      argv0
+                      "--"
+                    ];
+                in
+                ''
+                  cat > "$out/bin/${outputName}" <<'EOF'
+                  #!${pkgs.runtimeShell}
+                  exec ${apparmorPrefix}${secwrap}/bin/secwrap ${lib.escapeShellArgs secwrapArgs} "$@"
+                  EOF
+                  chmod +x "$out/bin/${outputName}"
+                ''
+              ) tools
+            );
+        in
         {
-          name ? "secwrap-wrappers",
-          secwrap ? secwrapPackage,
-          tools,
-        }:
-        pkgs.runCommand name { } (
-          ''
-            mkdir -p "$out/bin"
-          ''
-          + lib.concatMapStringsSep "\n" (
-            tool:
-            let
-              outputName = tool.outputName or tool.name;
-              argv0 = tool.argv0 or tool.name;
-              extraArgs = tool.extraSecwrapArgs or [ ];
-              apparmorPrefix =
-                if tool ? apparmorProfile then
-                  "${pkgs.apparmor-bin-utils}/bin/aa-exec -p ${lib.escapeShellArg tool.apparmorProfile} -- "
-                else
-                  "";
-              secwrapArgs =
-                [
-                  "--profile"
-                  tool.profile
-                ]
-                ++ extraArgs
-                ++ [
-                  "--target"
-                  tool.target
-                  "--argv0"
-                  argv0
-                  "--"
-                ];
-            in
-            ''
-              cat > "$out/bin/${outputName}" <<'EOF'
-              #!${pkgs.runtimeShell}
-              exec ${apparmorPrefix}${secwrap}/bin/secwrap ${lib.escapeShellArgs secwrapArgs} "$@"
-              EOF
-              chmod +x "$out/bin/${outputName}"
-            ''
-          ) tools
-        );
+          inherit makeSecwrapWrappers secwrapPackage pkgs;
+        };
     in
     {
-      lib.${system} = {
-        inherit makeSecwrapWrappers;
-      };
+      lib = forAllSystems (system: {
+        inherit (mkOutputs system) makeSecwrapWrappers;
+      });
 
-      packages.${system} = {
-        default = secwrapPackage;
+      packages = forAllSystems (
+        system:
+        let
+          outputs = mkOutputs system;
+          inherit (outputs) pkgs secwrapPackage makeSecwrapWrappers;
+        in
+        {
+          default = secwrapPackage;
 
-        example-wrappers = makeSecwrapWrappers {
-          name = "secwrap-example-wrappers";
-          tools = [
-            {
-              name = "broken-ls";
-              profile = "broken-ls";
-              target = "${pkgs.coreutils-full}/bin/ls";
-              argv0 = "ls";
-            }
-            {
-              name = "protected-ls";
-              profile = "local-cli";
-              target = "${pkgs.coreutils-full}/bin/ls";
-              argv0 = "ls";
-            }
-          ];
-        };
-      };
+          example-wrappers = makeSecwrapWrappers {
+            name = "secwrap-example-wrappers";
+            tools = [
+              {
+                name = "broken-ls";
+                profile = "broken-ls";
+                target = "${pkgs.coreutils-full}/bin/ls";
+                argv0 = "ls";
+              }
+              {
+                name = "protected-ls";
+                profile = "local-cli";
+                target = "${pkgs.coreutils-full}/bin/ls";
+                argv0 = "ls";
+              }
+            ];
+          };
+        }
+      );
 
-      devShells.${system}.default = pkgs.mkShell {
-        packages = [
-          pkgs.libseccomp
-          pkgs.pkg-config
-          pkgs.zig
-        ];
-      };
+      devShells = forAllSystems (
+        system:
+        let
+          inherit (mkOutputs system) pkgs;
+        in
+        {
+          default = pkgs.mkShell {
+            packages = [
+              pkgs.libseccomp
+              pkgs.pkg-config
+              pkgs.zig
+            ];
+          };
+        }
+      );
     };
 }
